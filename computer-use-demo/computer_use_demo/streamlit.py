@@ -4,6 +4,7 @@ Entrypoint for streamlit, see https://docs.streamlit.io/
 
 import asyncio
 import base64
+import logging
 import os
 import subprocess
 import traceback
@@ -17,6 +18,9 @@ from typing import cast, get_args
 
 import httpx
 import streamlit as st
+
+# Configure logging for streamlit
+logger = logging.getLogger(__name__)
 from anthropic import RateLimitError
 from anthropic.types.beta import (
     BetaContentBlockParam,
@@ -33,8 +37,8 @@ from computer_use_demo.tools import ToolResult, ToolVersion
 
 PROVIDER_TO_DEFAULT_MODEL_NAME: dict[APIProvider, str] = {
     APIProvider.ANTHROPIC: "claude-sonnet-4-5-20250929",
-    APIProvider.BEDROCK: "anthropic.claude-3-5-sonnet-20241022-v2:0",
-    APIProvider.VERTEX: "claude-3-5-sonnet-v2@20241022",
+    APIProvider.BEDROCK: "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    APIProvider.VERTEX: "claude-sonnet-4-5@20250929",
 }
 
 
@@ -89,6 +93,11 @@ MODEL_TO_MODEL_CONF: dict[str, ModelConfig] = {
     "claude-haiku-4-5-20251001": HAIKU_4_5,
     "anthropic.claude-haiku-4-5-20251001-v1:0": HAIKU_4_5,  # Bedrock
     "claude-haiku-4-5@20251001": HAIKU_4_5,  # Vertex
+    "apac.anthropic.claude-sonnet-4-20250514-v1:0": CLAUDE_4,  # Bedrock APAC Sonnet 4
+    "us.anthropic.claude-sonnet-4-20250514-v1:0": CLAUDE_4,  # Bedrock US Sonnet 4
+    "global.anthropic.claude-sonnet-4-5-20250929-v1:0": CLAUDE_4_5,  # Bedrock APAC Sonnet 4.5
+    "jp.anthropic.claude-sonnet-4-5-20250929-v1:0": CLAUDE_4_5,  # Bedrock US Sonnet 4.5
+    "claude-sonnet-4-5@20250929": CLAUDE_4_5,  # Vertex Sonnet 4.5
 }
 
 CONFIG_DIR = PosixPath("~/.anthropic").expanduser()
@@ -157,9 +166,14 @@ def setup_state():
 
 
 def _reset_model():
-    st.session_state.model = PROVIDER_TO_DEFAULT_MODEL_NAME[
-        cast(APIProvider, st.session_state.provider)
-    ]
+    # 環境変数からモデルを取得、なければデフォルト
+    env_model = os.getenv("ANTHROPIC_MODEL")
+    if env_model:
+        st.session_state.model = env_model
+    else:
+        st.session_state.model = PROVIDER_TO_DEFAULT_MODEL_NAME[
+            cast(APIProvider, st.session_state.provider)
+        ]
     _reset_model_conf()
 
 
@@ -326,33 +340,40 @@ async def main():
 
         if most_recent_message["role"] is not Sender.USER:
             # we don't have a user message to respond to, exit early
+            logger.debug("No user message to respond to, exiting early")
             return
 
+        logger.info(f"Starting sampling loop: model={st.session_state.model}, provider={st.session_state.provider}")
         with track_sampling_loop():
             # run the agent sampling loop with the newest message
-            st.session_state.messages = await sampling_loop(
-                system_prompt_suffix=st.session_state.custom_system_prompt,
-                model=st.session_state.model,
-                provider=st.session_state.provider,
-                messages=st.session_state.messages,
-                output_callback=partial(_render_message, Sender.BOT),
-                tool_output_callback=partial(
-                    _tool_output_callback, tool_state=st.session_state.tools
-                ),
-                api_response_callback=partial(
-                    _api_response_callback,
-                    tab=http_logs,
-                    response_state=st.session_state.responses,
-                ),
-                api_key=st.session_state.api_key,
-                only_n_most_recent_images=st.session_state.only_n_most_recent_images,
-                tool_version=st.session_state.tool_versions,
-                max_tokens=st.session_state.output_tokens,
-                thinking_budget=st.session_state.thinking_budget
-                if st.session_state.thinking
-                else None,
-                token_efficient_tools_beta=st.session_state.token_efficient_tools_beta,
-            )
+            try:
+                st.session_state.messages = await sampling_loop(
+                    system_prompt_suffix=st.session_state.custom_system_prompt,
+                    model=st.session_state.model,
+                    provider=st.session_state.provider,
+                    messages=st.session_state.messages,
+                    output_callback=partial(_render_message, Sender.BOT),
+                    tool_output_callback=partial(
+                        _tool_output_callback, tool_state=st.session_state.tools
+                    ),
+                    api_response_callback=partial(
+                        _api_response_callback,
+                        tab=http_logs,
+                        response_state=st.session_state.responses,
+                    ),
+                    api_key=st.session_state.api_key,
+                    only_n_most_recent_images=st.session_state.only_n_most_recent_images,
+                    tool_version=st.session_state.tool_version,
+                    max_tokens=st.session_state.output_tokens,
+                    thinking_budget=st.session_state.thinking_budget
+                    if st.session_state.thinking
+                    else None,
+                    token_efficient_tools_beta=st.session_state.token_efficient_tools_beta,
+                )
+                logger.info("Sampling loop completed successfully")
+            except Exception as e:
+                logger.error(f"Sampling loop failed: {type(e).__name__}: {str(e)[:200]}", exc_info=True)
+                raise
 
 
 def maybe_add_interruption_blocks():
@@ -455,8 +476,15 @@ def _tool_output_callback(
     tool_output: ToolResult, tool_id: str, tool_state: dict[str, ToolResult]
 ):
     """Handle a tool output by storing it to state and rendering it."""
-    tool_state[tool_id] = tool_output
-    _render_message(Sender.TOOL, tool_output)
+    try:
+        logger.debug(f"_tool_output_callback start: tool_id={tool_id}, in_sampling_loop={st.session_state.get('in_sampling_loop', False)}")
+        tool_state[tool_id] = tool_output
+        logger.debug(f"_tool_output_callback: tool_state updated, calling _render_message")
+        _render_message(Sender.TOOL, tool_output)
+        logger.debug(f"_tool_output_callback: _render_message completed")
+    except Exception as e:
+        # Catch any rendering errors to prevent loop interruption
+        logger.error(f"Failed in tool_output_callback: {type(e).__name__}: {str(e)[:200]}", exc_info=True)
 
 
 def _render_api_response(
@@ -503,40 +531,46 @@ def _render_message(
     message: str | BetaContentBlockParam | ToolResult,
 ):
     """Convert input from the user or output from the agent to a streamlit message."""
-    # streamlit's hotreloading breaks isinstance checks, so we need to check for class names
-    is_tool_result = not isinstance(message, str | dict)
-    if not message or (
-        is_tool_result
-        and st.session_state.hide_images
-        and not hasattr(message, "error")
-        and not hasattr(message, "output")
-    ):
-        return
-    with st.chat_message(sender):
-        if is_tool_result:
-            message = cast(ToolResult, message)
-            if message.output:
-                if message.__class__.__name__ == "CLIResult":
-                    st.code(message.output)
+    try:
+        # streamlit's hotreloading breaks isinstance checks, so we need to check for class names
+        is_tool_result = not isinstance(message, str | dict)
+        if not message or (
+            is_tool_result
+            and st.session_state.hide_images
+            and not hasattr(message, "error")
+            and not hasattr(message, "output")
+        ):
+            return
+        with st.chat_message(sender):
+            if is_tool_result:
+                message = cast(ToolResult, message)
+                if message.output:
+                    if message.__class__.__name__ == "CLIResult":
+                        st.code(message.output)
+                    else:
+                        st.markdown(message.output)
+                if message.error:
+                    st.error(message.error)
+                if message.base64_image and not st.session_state.hide_images:
+                    st.image(base64.b64decode(message.base64_image))
+            elif isinstance(message, dict):
+                if message["type"] == "text":
+                    st.write(message["text"])
+                elif message["type"] == "thinking":
+                    thinking_content = message.get("thinking", "")
+                    st.markdown(f"[Thinking]\n\n{thinking_content}")
+                elif message["type"] == "tool_use":
+                    st.code(f"Tool Use: {message['name']}\nInput: {message['input']}")
                 else:
-                    st.markdown(message.output)
-            if message.error:
-                st.error(message.error)
-            if message.base64_image and not st.session_state.hide_images:
-                st.image(base64.b64decode(message.base64_image))
-        elif isinstance(message, dict):
-            if message["type"] == "text":
-                st.write(message["text"])
-            elif message["type"] == "thinking":
-                thinking_content = message.get("thinking", "")
-                st.markdown(f"[Thinking]\n\n{thinking_content}")
-            elif message["type"] == "tool_use":
-                st.code(f"Tool Use: {message['name']}\nInput: {message['input']}")
+                    # only expected return types are text and tool_use
+                    raise Exception(f"Unexpected response type {message['type']}")
             else:
-                # only expected return types are text and tool_use
-                raise Exception(f"Unexpected response type {message['type']}")
-        else:
-            st.markdown(message)
+                st.markdown(message)
+    except Exception as e:
+        # Catch rendering errors to prevent UI crashes
+        logger.error(f"Failed to render message: {type(e).__name__}: {str(e)[:200]}")
+        with st.chat_message(sender):
+            st.error(f"Error rendering message: {type(e).__name__}")
 
 
 if __name__ == "__main__":

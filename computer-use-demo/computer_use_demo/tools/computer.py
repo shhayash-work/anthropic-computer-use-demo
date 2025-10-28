@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import logging
 import os
 import shlex
 import shutil
@@ -12,6 +13,9 @@ from anthropic.types.beta import BetaToolComputerUse20241022Param, BetaToolUnion
 
 from .base import BaseAnthropicTool, ToolError, ToolResult
 from .run import run
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 OUTPUT_DIR = "/tmp/outputs"
 
@@ -131,6 +135,7 @@ class BaseComputerTool:
         coordinate: tuple[int, int] | None = None,
         **kwargs,
     ):
+        logger.info(f"ComputerTool20241022.__call__: action={action}, text={text}, coordinate={coordinate}")
         if action in ("mouse_move", "left_click_drag"):
             if coordinate is None:
                 raise ToolError(f"coordinate is required for {action}")
@@ -249,12 +254,17 @@ class BaseComputerTool:
 
     async def shell(self, command: str, take_screenshot=True) -> ToolResult:
         """Run a shell command and return the output, error, and optionally a screenshot."""
+        logger.debug(f"Executing shell command: {command}, take_screenshot={take_screenshot}")
         _, stdout, stderr = await run(command)
+        if stderr:
+            logger.warning(f"Shell command stderr: {stderr[:200]}")
         base64_image = None
 
         if take_screenshot:
             # delay to let things settle before taking a screenshot
+            logger.debug(f"Waiting {self._screenshot_delay}s before screenshot")
             await asyncio.sleep(self._screenshot_delay)
+            logger.debug("Taking screenshot after command")
             base64_image = (await self.screenshot()).base64_image
 
         return ToolResult(output=stdout, error=stderr, base64_image=base64_image)
@@ -313,6 +323,7 @@ class ComputerTool20250124(BaseComputerTool, BaseAnthropicTool):
         key: str | None = None,
         **kwargs,
     ):
+        logger.info(f"ComputerTool20250124.__call__: action={action}, text={text}, coordinate={coordinate}")
         if action in ("left_mouse_down", "left_mouse_up"):
             if coordinate is not None:
                 raise ToolError(f"coordinate is not accepted for {action=}.")

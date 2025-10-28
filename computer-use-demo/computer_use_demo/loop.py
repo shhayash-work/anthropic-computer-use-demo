@@ -2,6 +2,7 @@
 Agentic sampling loop that calls the Claude API and local implementation of anthropic-defined computer use tools.
 """
 
+import logging
 import platform
 from collections.abc import Callable
 from datetime import datetime
@@ -9,6 +10,27 @@ from enum import StrEnum
 from typing import Any, cast
 
 import httpx
+
+# Configure detailed logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
+    handlers=[
+        logging.FileHandler('/tmp/computer_use_demo.log'),
+        logging.StreamHandler()
+    ]
+)
+
+# Suppress verbose logging from PIL, httpcore, botocore, anthropic, asyncio, and tornado
+logging.getLogger('PIL').setLevel(logging.WARNING)
+logging.getLogger('httpcore').setLevel(logging.WARNING)
+logging.getLogger('httpx').setLevel(logging.INFO)
+logging.getLogger('botocore').setLevel(logging.WARNING)
+logging.getLogger('anthropic._base_client').setLevel(logging.INFO)
+logging.getLogger('asyncio').setLevel(logging.INFO)
+logging.getLogger('tornado').setLevel(logging.WARNING)
+
+logger = logging.getLogger(__name__)
 from anthropic import (
     Anthropic,
     AnthropicBedrock,
@@ -88,6 +110,8 @@ async def sampling_loop(
     """
     Agentic sampling loop for the assistant/tool interaction of computer use.
     """
+    logger.info(f"=== sampling_loop started: model={model}, provider={provider}, tool_version={tool_version} ===")
+    
     tool_group = TOOL_GROUPS_BY_VERSION[tool_version]
     tool_collection = ToolCollection(*(ToolCls() for ToolCls in tool_group.tools))
     system = BetaTextBlockParam(
@@ -95,7 +119,10 @@ async def sampling_loop(
         text=f"{SYSTEM_PROMPT}{' ' + system_prompt_suffix if system_prompt_suffix else ''}",
     )
 
+    loop_iteration = 0
     while True:
+        loop_iteration += 1
+        logger.info(f"--- Loop iteration {loop_iteration} started ---")
         enable_prompt_caching = False
         betas = [tool_group.beta_flag] if tool_group.beta_flag else []
         if token_efficient_tools_beta:
@@ -135,6 +162,7 @@ async def sampling_loop(
         # we use raw_response to provide debug information to streamlit. Your
         # implementation may be able call the SDK directly with:
         # `response = client.messages.create(...)` instead.
+        logger.info(f"Calling API: model={model}, max_tokens={max_tokens}, message_count={len(messages)}")
         try:
             raw_response = client.beta.messages.with_raw_response.create(
                 max_tokens=max_tokens,
@@ -145,18 +173,25 @@ async def sampling_loop(
                 betas=betas,
                 extra_body=extra_body,
             )
+            logger.info("API call successful")
         except (APIStatusError, APIResponseValidationError) as e:
+            logger.error(f"API Status Error: {type(e).__name__}: {str(e)[:200]}")
             api_response_callback(e.request, e.response, e)
             return messages
         except APIError as e:
+            logger.error(f"API Error: {type(e).__name__}: {str(e)[:200]}")
             api_response_callback(e.request, e.body, e)
             return messages
+        except Exception as e:
+            logger.error(f"Unexpected error during API call: {type(e).__name__}: {str(e)[:200]}", exc_info=True)
+            raise
 
         api_response_callback(
             raw_response.http_response.request, raw_response.http_response, None
         )
 
         response = raw_response.parse()
+        logger.debug(f"Response parsed: stop_reason={response.stop_reason}")
 
         response_params = _response_to_params(response)
         messages.append(
@@ -167,23 +202,53 @@ async def sampling_loop(
         )
 
         tool_result_content: list[BetaToolResultBlockParam] = []
+        logger.info(f"Processing response_params, count: {len(response_params)}")
         for content_block in response_params:
             output_callback(content_block)
             if isinstance(content_block, dict) and content_block.get("type") == "tool_use":
                 # Type narrowing for tool use blocks
                 tool_use_block = cast(BetaToolUseBlockParam, content_block)
-                result = await tool_collection.run(
-                    name=tool_use_block["name"],
-                    tool_input=cast(dict[str, Any], tool_use_block.get("input", {})),
-                )
-                tool_result_content.append(
-                    _make_api_tool_result(result, tool_use_block["id"])
-                )
-                tool_output_callback(result, tool_use_block["id"])
+                tool_name = tool_use_block["name"]
+                tool_input = cast(dict[str, Any], tool_use_block.get("input", {}))
+                logger.info(f"Executing tool: {tool_name}, input: {tool_input}")
+                try:
+                    result = await tool_collection.run(
+                        name=tool_name,
+                        tool_input=tool_input,
+                    )
+                    if result.error:
+                        logger.warning(f"Tool execution completed with error: {tool_name}, error={result.error[:200]}")
+                    else:
+                        logger.info(f"Tool execution completed: {tool_name}, success=True")
+                except Exception as e:
+                    logger.error(f"Tool execution failed: {tool_name}, error: {type(e).__name__}: {str(e)[:200]}", exc_info=True)
+                    raise
+                
+                logger.info(f"Before appending tool result to tool_result_content, current length: {len(tool_result_content)}")
+                try:
+                    tool_result_content.append(
+                        _make_api_tool_result(result, tool_use_block["id"])
+                    )
+                    logger.info(f"After appending tool result, new length: {len(tool_result_content)}")
+                except Exception as e:
+                    logger.error(f"Failed to append tool result: {type(e).__name__}: {str(e)}", exc_info=True)
+                    raise
+                
+                logger.info(f"Before calling tool_output_callback for tool_id: {tool_use_block['id']}")
+                try:
+                    tool_output_callback(result, tool_use_block["id"])
+                    logger.info(f"After calling tool_output_callback successfully")
+                except Exception as e:
+                    logger.error(f"tool_output_callback failed: {type(e).__name__}: {str(e)}", exc_info=True)
+                    raise
 
+        logger.info(f"Finished processing all content_blocks, tool_result_content length: {len(tool_result_content)}")
+        
         if not tool_result_content:
+            logger.info(f"No tool results, ending loop. Total iterations: {loop_iteration}")
             return messages
 
+        logger.debug(f"Adding {len(tool_result_content)} tool results to messages")
         messages.append({"content": tool_result_content, "role": "user"})
 
 
