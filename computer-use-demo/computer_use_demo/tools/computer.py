@@ -17,7 +17,7 @@ from .run import run
 # Configure logging
 logger = logging.getLogger(__name__)
 
-OUTPUT_DIR = "/tmp/outputs"
+OUTPUT_DIR = os.getenv("SCREENSHOT_DIR", "/home/computeruse/screenshots")
 
 TYPING_DELAY_MS = 12
 TYPING_GROUP_SIZE = 50
