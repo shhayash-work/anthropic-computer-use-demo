@@ -87,6 +87,23 @@ def chunks(s: str, chunk_size: int) -> list[str]:
     return [s[i : i + chunk_size] for i in range(0, len(s), chunk_size)]
 
 
+def contains_non_ascii(text: str) -> bool:
+    """
+    Check if the text contains non-ASCII characters (e.g., Japanese, Unicode).
+    
+    Args:
+        text: Text to check
+        
+    Returns:
+        True if text contains non-ASCII characters, False otherwise
+    """
+    try:
+        text.encode('ascii')
+        return False
+    except UnicodeEncodeError:
+        return True
+
+
 class BaseComputerTool:
     """
     A tool that allows the agent to interact with the screen, keyboard, and mouse of the current computer.
@@ -166,15 +183,49 @@ class BaseComputerTool:
                 command_parts = [self.xdotool, f"key -- {text}"]
                 return await self.shell(" ".join(command_parts))
             elif action == "type":
-                results: list[ToolResult] = []
-                for chunk in chunks(text, TYPING_GROUP_SIZE):
-                    command_parts = [
-                        self.xdotool,
-                        f"type --delay {TYPING_DELAY_MS} -- {shlex.quote(chunk)}",
-                    ]
-                    results.append(
-                        await self.shell(" ".join(command_parts), take_screenshot=False)
-                    )
+                # Check if text contains non-ASCII characters (e.g., Japanese)
+                # If so, use clipboard paste method for better compatibility with
+                # web browsers and applications like Firefox, Excel, etc.
+                if contains_non_ascii(text):
+                    logger.info(f"Text contains non-ASCII characters, using clipboard method: {text[:50]}...")
+                    # Use clipboard method: copy to clipboard then paste
+                    # Split into chunks to handle very long text
+                    results: list[ToolResult] = []
+                    for chunk in chunks(text, TYPING_GROUP_SIZE):
+                        # Use heredoc to pass text to xclip, avoiding issues with shell quoting
+                        # This handles multi-line text and special characters correctly
+                        # IMPORTANT: xsel is used instead of xclip because xclip waits in foreground
+                        # and causes timeouts. xsel copies to clipboard and exits immediately.
+                        copy_cmd = f"{self._display_prefix}xsel -i -b << 'XCLIP_EOF'\n{chunk}\nXCLIP_EOF"
+                        copy_result = await self.shell(copy_cmd, take_screenshot=False)
+                        if copy_result.error:
+                            logger.warning(f"xclip copy error: {copy_result.error}")
+                        results.append(copy_result)
+                        
+                        # Paste using xdotool
+                        paste_cmd = f"{self.xdotool} key ctrl+v"
+                        paste_result = await self.shell(paste_cmd, take_screenshot=False)
+                        results.append(paste_result)
+                        
+                        # Small delay between chunks
+                        await asyncio.sleep(0.05)
+                else:
+                    # ASCII-only text: use traditional xdotool type method
+                    logger.debug(f"Text is ASCII-only, using xdotool type method")
+                    results: list[ToolResult] = []
+                    for chunk in chunks(text, TYPING_GROUP_SIZE):
+                        command_parts = [
+                            self.xdotool,
+                            f"type --delay {TYPING_DELAY_MS} -- {shlex.quote(chunk)}",
+                        ]
+                        results.append(
+                            await self.shell(" ".join(command_parts), take_screenshot=False)
+                        )
+                
+                # Wait for the screen to update after typing/pasting
+                # This ensures the screenshot captures the updated state
+                await asyncio.sleep(0.5)
+                
                 screenshot_base64 = (await self.screenshot()).base64_image
                 return ToolResult(
                     output="".join(result.output or "" for result in results),

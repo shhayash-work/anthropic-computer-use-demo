@@ -30,6 +30,7 @@ RUN apt-get update && \
     xvfb \
     xterm \
     xdotool \
+    xsel \
     scrot \
     imagemagick \
     sudo \
