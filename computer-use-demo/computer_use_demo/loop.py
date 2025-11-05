@@ -31,6 +31,15 @@ logging.getLogger('asyncio').setLevel(logging.INFO)
 logging.getLogger('tornado').setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+# Langfuse integration for LLM observability
+try:
+    from langfuse.decorators import langfuse_context, observe
+    LANGFUSE_ENABLED = True
+except ImportError:
+    LANGFUSE_ENABLED = False
+    logger.warning("Langfuse not installed. LLM observability disabled. Install with: pip install langfuse")
+
 from anthropic import (
     Anthropic,
     AnthropicBedrock,
@@ -59,6 +68,13 @@ from .tools import (
 )
 
 PROMPT_CACHING_BETA_FLAG = "prompt-caching-2024-07-31"
+
+
+def conditional_observe(func):
+    """Apply @observe decorator only if Langfuse is enabled"""
+    if LANGFUSE_ENABLED:
+        return observe()(func)
+    return func
 
 
 class APIProvider(StrEnum):
@@ -90,6 +106,59 @@ SYSTEM_PROMPT = f"""<SYSTEM_CAPABILITY>
 </IMPORTANT>"""
 
 
+@conditional_observe
+async def _call_claude_api(
+    client,
+    max_tokens: int,
+    messages: list,
+    model: str,
+    system: dict,
+    tools: list,
+    betas: list,
+    extra_body: dict,
+    loop_iteration: int,
+    provider: APIProvider,
+):
+    """
+    Single Claude API call - logged as separate generation in Langfuse.
+    Each call to this function will appear as a distinct generation in the trace.
+    """
+    raw_response = client.beta.messages.with_raw_response.create(
+        max_tokens=max_tokens,
+        messages=messages,
+        model=model,
+        system=[system],
+        tools=tools,
+        betas=betas,
+        extra_body=extra_body,
+    )
+    
+    response = raw_response.parse()
+    
+    # Log usage to Langfuse if enabled
+    if LANGFUSE_ENABLED:
+        try:
+            langfuse_context.update_current_observation(
+                model=model,
+                usage={
+                    "input": response.usage.input_tokens,
+                    "output": response.usage.output_tokens,
+                },
+                metadata={
+                    "provider": str(provider),
+                    "loop_iteration": loop_iteration,
+                    "stop_reason": response.stop_reason,
+                    "cache_creation_input_tokens": getattr(response.usage, "cache_creation_input_tokens", 0),
+                    "cache_read_input_tokens": getattr(response.usage, "cache_read_input_tokens", 0),
+                }
+            )
+        except Exception as e:
+            logger.warning(f"Failed to log to Langfuse: {e}")
+    
+    return raw_response, response
+
+
+@conditional_observe
 async def sampling_loop(
     *,
     model: str,
@@ -146,7 +215,14 @@ async def sampling_loop(
             # Use type ignore to bypass TypedDict check until SDK types are updated
             system["cache_control"] = {"type": "ephemeral"}  # type: ignore
 
-        if only_n_most_recent_images:
+        # For Bedrock, always limit to max 3 images since caching is not available
+        if provider == APIProvider.BEDROCK:
+            _maybe_filter_to_n_most_recent_images(
+                messages,
+                images_to_keep=3,
+                min_removal_threshold=0,  # No cache to preserve, so remove immediately
+            )
+        elif only_n_most_recent_images:
             _maybe_filter_to_n_most_recent_images(
                 messages,
                 only_n_most_recent_images,
@@ -160,20 +236,21 @@ async def sampling_loop(
             }
 
         # Call the API
-        # we use raw_response to provide debug information to streamlit. Your
-        # implementation may be able call the SDK directly with:
-        # `response = client.messages.create(...)` instead.
+        # Each call is logged as a separate generation in Langfuse
         logger.info(f"Calling API: model={model}, max_tokens={max_tokens}, message_count={len(messages)}")
         logger.info(f"messages: {messages}")
         try:
-            raw_response = client.beta.messages.with_raw_response.create(
+            raw_response, response = await _call_claude_api(
+                client=client,
                 max_tokens=max_tokens,
                 messages=messages,
                 model=model,
-                system=[system],
+                system=system,
                 tools=tool_collection.to_params(),
                 betas=betas,
                 extra_body=extra_body,
+                loop_iteration=loop_iteration,
+                provider=provider,
             )
             logger.info("API call successful")
         except (APIStatusError, APIResponseValidationError) as e:
@@ -192,7 +269,6 @@ async def sampling_loop(
             raw_response.http_response.request, raw_response.http_response, None
         )
 
-        response = raw_response.parse()
         logger.debug(f"Response parsed: stop_reason={response.stop_reason}")
 
         response_params = _response_to_params(response)
@@ -264,6 +340,19 @@ def _maybe_filter_to_n_most_recent_images(
     the conversation progresses, remove all but the final `images_to_keep` tool_result
     images in place, with a chunk of min_removal_threshold to reduce the amount we
     break the implicit prompt cache.
+    
+    For Bedrock (min_removal_threshold=0):
+    - Always keeps exactly `images_to_keep` (3) most recent images
+    - Removes older images immediately without chunking
+    
+    For Anthropic with caching (min_removal_threshold>0):
+    - Removes images in chunks to preserve cache efficiency
+    - Example with images_to_keep=3, min_removal_threshold=3:
+      * 1-3 images: keep all
+      * 4-5 images: keep all (removal would be 1-2, rounded down to 0)
+      * 6 images: remove 3, keep 3
+      * 7-8 images: remove 3, keep 4-5
+      * 9 images: remove 6, keep 3
     """
     if images_to_keep is None:
         return messages
@@ -287,10 +376,16 @@ def _maybe_filter_to_n_most_recent_images(
         if isinstance(content, dict) and content.get("type") == "image"
     )
 
+    # Calculate how many images to remove
     images_to_remove = total_images - images_to_keep
-    # for better cache behavior, we want to remove in chunks
-    images_to_remove -= images_to_remove % min_removal_threshold
+    
+    # For better cache behavior, we want to remove in chunks
+    # When min_removal_threshold=0 (Bedrock), this has no effect and removes immediately
+    # When min_removal_threshold>0 (Anthropic), rounds down to nearest multiple
+    if min_removal_threshold > 0:
+        images_to_remove -= images_to_remove % min_removal_threshold
 
+    # Remove oldest images first (iterate from beginning of messages)
     for tool_result in tool_result_blocks:
         if isinstance(tool_result.get("content"), list):
             new_content = []
@@ -298,7 +393,7 @@ def _maybe_filter_to_n_most_recent_images(
                 if isinstance(content, dict) and content.get("type") == "image":
                     if images_to_remove > 0:
                         images_to_remove -= 1
-                        continue
+                        continue  # Skip this image (remove it)
                 new_content.append(content)
             tool_result["content"] = new_content
 
