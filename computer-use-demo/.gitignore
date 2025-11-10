@@ -6,10 +6,3 @@ __pycache__
 # 実行時に生成されるファイル
 conversations/
 screenshots/
-
-# 開発用スクリプト・メモ
-omit_image_data.py
-GRADIO_MIGRATION_SUMMARY.md
-
-# 機密情報を含むファイル（認証情報がハードコードされている）
-docker-run.sh
